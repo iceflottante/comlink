@@ -295,7 +295,7 @@ export function expose(
   ep: Endpoint = globalThis as any,
   allowedOrigins: (string | RegExp)[] = ["*"]
 ) {
-  ep.addEventListener("message", function callback(ev: MessageEvent) {
+  ep.addEventListener("message", async function callback(ev: MessageEvent) {
     if (!ev || !ev.data) {
       return;
     }
@@ -308,9 +308,21 @@ export function expose(
       ...(ev.data as Message),
     };
     const argumentList = (ev.data.argumentList || []).map(fromWireValue);
+
+    console.log("<worker.onmessage>", id, type, path, argumentList);
+
     let returnValue;
     try {
-      const parent = path.slice(0, -1).reduce((obj, prop) => obj[prop], obj);
+      const parent = await path
+        .slice(0, -1)
+        .reduce(async (obj, prop) => {
+          const awaitedObj = await obj
+          console.log(awaitedObj, prop)
+          if (prop === 'lazyApply') {
+            return awaitedObj()
+          }
+          return awaitedObj[prop]
+        }, obj);
       const rawValue = path.reduce((obj, prop) => obj[prop], obj);
       switch (type) {
         case MessageType.GET:
@@ -358,6 +370,7 @@ export function expose(
         return { value, [throwMarker]: 0 };
       })
       .then((returnValue) => {
+        console.log("<worker.return>", returnValue);
         const [wireValue, transferables] = toWireValue(returnValue);
         ep.postMessage({ ...wireValue, id }, transferables);
         if (type === MessageType.RELEASE) {
@@ -453,6 +466,7 @@ function createProxy<T>(
   let isProxyReleased = false;
   const proxy = new Proxy(target, {
     get(_target, prop) {
+      console.log("<main.get>", path, prop);
       throwIfProxyReleased(isProxyReleased);
       if (prop === releaseProxy) {
         return () => {
@@ -471,9 +485,18 @@ function createProxy<T>(
         }).then(fromWireValue);
         return r.then.bind(r);
       }
+
+      if (prop === "lazyApply") {
+        requestNoResponseMessage(ep, {
+          type: MessageType.GET,
+          path: path.map((p) => p.toString()),
+        });
+      }
+
       return createProxy(ep, [...path, prop]);
     },
     set(_target, prop, rawValue) {
+      console.log("<main.set>", path, prop, rawValue);
       throwIfProxyReleased(isProxyReleased);
       // FIXME: ES6 Proxy Handler `set` methods are supposed to return a
       // boolean. To show good will, we return true asynchronously ¯\_(ツ)_/¯
@@ -489,6 +512,7 @@ function createProxy<T>(
       ).then(fromWireValue) as any;
     },
     apply(_target, _thisArg, rawArgumentList) {
+      console.log("<main.apply>", path, rawArgumentList);
       throwIfProxyReleased(isProxyReleased);
       const last = path[path.length - 1];
       if ((last as any) === createEndpoint) {
@@ -512,6 +536,7 @@ function createProxy<T>(
       ).then(fromWireValue);
     },
     construct(_target, rawArgumentList) {
+      console.log("<main.construct>", path, rawArgumentList);
       throwIfProxyReleased(isProxyReleased);
       const [argumentList, transferables] = processArguments(rawArgumentList);
       return requestResponseMessage(
@@ -612,6 +637,18 @@ function requestResponseMessage(
     }
     ep.postMessage({ id, ...msg }, transfers);
   });
+}
+
+function requestNoResponseMessage(
+  ep: Endpoint,
+  msg: Message,
+  transfers?: Transferable[]
+): void {
+  const id = generateUUID();
+  if (ep.start) {
+    ep.start();
+  }
+  ep.postMessage({ id, ...msg }, transfers);
 }
 
 function generateUUID(): string {
